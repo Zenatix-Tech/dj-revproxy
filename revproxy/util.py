@@ -3,9 +3,15 @@
 # This file is part of dj-revproxy released under the MIT license. 
 # See the NOTICE for more information.
 
-from urlparse import urljoin, urlparse, urlunparse
-from django.http import absolute_http_url_re
+import sys
 
+from urlparse import urljoin, urlparse, urlunparse
+#try:
+#    from django.http.request import absolute_http_url_re  # Django 1.5+
+#except ImportError:
+#    from django.http import absolute_http_url_re
+import re
+absolute_http_url_re = re.compile(r"^https?://", re.I)
 def absolute_uri(request, base_url):
     if not absolute_http_url_re.match(base_url):
         if base_url.startswith("/"):
@@ -48,26 +54,39 @@ def coerce_put_post(request):
             
         request.PUT = request.POST
 
-
 def rewrite_location(request, prefix_path, location):
+    prefix_path = prefix_path or ''
     url = urlparse(location)
-    source = url.parse(request.get_host)
+    scheme = request.is_secure() and 'https' or 'http'
 
     if not absolute_http_url_re.match(location):
         # remote server doesn't follow rfc2616
-        proxy_uri = '%s://%s%s' % (
-                request.is_secure() and 'https' or 'http',
+        proxy_uri = '%s://%s%s' % (scheme,
                 request.get_host(), prefix_path)
-
         return  urljoin(proxy_uri, location)
-    
-    elif url.scheme != source.scheme or url.netloc != source.netloc:
-        url.path = prefix_path + url.path
-        return urlunparse((source.scheme, source.netloc,
-            prefix_path+url.path, url.params, url.query, url.fragment))
-
+    elif url.scheme != scheme or url.netloc != request.get_host():
+        return urlunparse((scheme, request.get_host(), 
+            prefix_path + url.path, url.params, url.query, url.fragment))
     return location
 
+def import_conn_manager(module):
+    parts = module.rsplit(":", 1)
+    if len(parts) == 1:
+        raise ImportError("can't import handler '%s'" % module)
+
+    module, obj = parts[0], parts[1]
+    try:
+        __import__(module)
+    except ImportError:
+        if module.endswith(".py") and os.path.exists(module):
+            raise ImportError("Failed to find manager, did "
+                "you mean '%s:%s'?" % (module.rsplit(".",1)[0], obj))
+    
+    mod = sys.modules[module]
+    mgr = eval(obj, mod.__dict__)
+    if mgr is None:
+        raise ImportError("Failed to find manager object: %r" % mgr)
+    return mgr
 
 
 

@@ -4,13 +4,50 @@
 # See the NOTICE for more information.
 
 from __future__ import with_statement
+import uuid
 
-from django.core.servers.basehttp import is_hop_by_hop
+from django.views.decorators.csrf import csrf_exempt
+#from django.core.servers.basehttp import is_hop_by_hop
 from django.http import HttpResponse, Http404, HttpResponsePermanentRedirect
 import restkit
 
 from revproxy.util import absolute_uri, header_name, coerce_put_post, \
-rewrite_location
+rewrite_location, import_conn_manager
+
+# mirrored since this is removed in django 1.4
+_hop_headers = {
+    'connection':1, 'keep-alive':1, 'proxy-authenticate':1,
+    'proxy-authorization':1, 'te':1, 'trailers':1, 'transfer-encoding':1,
+    'upgrade':1
+}
+def is_hop_by_hop(header_name):
+    """Return true if 'header_name' is an HTTP/1.1 "Hop-by-Hop" header"""
+    return header_name.lower() in _hop_headers
+
+_conn_manager = None
+def set_conn_manager():
+    from django.conf import settings
+#    from django.utils.importlib import import_module
+
+    global _conn_manager
+
+    nb_connections = getattr(settings, 'REVPROXY_NB_CONNECTIONS', 10)
+    timeout = getattr(settings, 'REVPROXY_TIMEOUT', 300)
+
+    
+    conn_manager_uri = getattr(settings, 'REVPROXY_CONN_MGR', None)
+    if not conn_manager_uri:
+        from restkit.conn.threaded import TConnectionManager
+        klass = TConnectionManager
+    else:
+        klass = import_conn_manager(conn_manager_uri)
+    _conn_manager = klass(timeout=timeout, nb_connections=nb_connections)
+
+def get_conn_manager():
+    global _conn_manager
+    if not _conn_manager:
+        set_conn_manager()
+    return _conn_manager
 
 
 class HttpResponseBadGateway(HttpResponse):
@@ -30,7 +67,7 @@ class BodyWrapper(object):
             raise StopIteration()
         return ret
 
-
+@csrf_exempt
 def proxy_request(request, destination=None, prefix=None, headers=None,
         no_redirect=False, decompress=False, **kwargs):
     """ generic view to proxy a request.
@@ -101,26 +138,33 @@ def proxy_request(request, destination=None, prefix=None, headers=None,
     # we forward for
     headers["X-Forwarded-For"] = request.get_host()
 
+    # used in request session store.
+    headers["X-Restkit-Reqid"] = uuid.uuid4().hex
+
     # django doesn't understand PUT sadly
     method = request.method.upper()
     if method == "PUT":
         coerce_put_post(request)
 
     # do the request
+
     try:
+        #print "DDDO THE REQUEST",request.body
         resp = restkit.request(proxied_url, method=method,
-                body=request.raw_post_data, headers=headers,
+                body=request.body, headers=headers,
                 follow_redirect=True,
-                decompress=decompress)
+                decompress=decompress,
+                conn_manager=get_conn_manager())
+        #print "RESPONSE WAS there",resp.__dict__
     except restkit.RequestFailed, e:
         msg = getattr(e, 'msg', '')
-    
+        #print "REQUEST FAILED"
         if e.status_int >= 100:
             resp = e.response
             body = msg
         else:
             return http.HttpResponseBadRequest(msg)
-
+    #print "REQUEST NOT FAILED"
     with resp.body_stream() as body:
         response = HttpResponse(BodyWrapper(body), status=resp.status_int)
 
@@ -131,6 +175,8 @@ def proxy_request(request, destination=None, prefix=None, headers=None,
                 continue
             if kl  == "location":
                 response[k] = rewrite_location(request, prefix, v)
+                print v
+                print response[k]
             else:
                 response[k] = v
         return response
